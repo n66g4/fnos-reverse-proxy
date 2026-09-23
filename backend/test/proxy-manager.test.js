@@ -50,6 +50,28 @@ const freePortRange = async (width = 2) => {
   throw new Error('No free consecutive port range');
 };
 
+test('runtime history tolerates corruption, prunes deleted rules and keeps demo data separate', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-history-'));
+  const store = new ConfigStore(directory); store.load();
+  const rule = store.createRule({ name: 'History', enabled: false, protocol: 'http', listenPort: 18765, targetHost: '127.0.0.1', targetPort: 80 });
+  const file = path.join(directory, 'runtime-history.json');
+  fs.writeFileSync(file, 'invalid JSON');
+  const manager = new ProxyManager({ store, logger });
+  try {
+    await manager.startAll();
+    assert.equal(manager.snapshot().rules[rule.id].connections, 0);
+    manager.runtimes.get(rule.id).connections = 23;
+    manager.saveHistory();
+    const beforeDemo = fs.readFileSync(file, 'utf8');
+    const demo = new ProxyManager({ store, logger, demoMode: true });
+    await demo.startAll(); await demo.stopAll();
+    assert.equal(fs.readFileSync(file, 'utf8'), beforeDemo);
+    store.deleteRule(rule.id);
+    await manager.reload();
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).rules, {});
+  } finally { await manager.stopAll(); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('forwards HTTP requests with custom headers and a trace ID', async () => {
   const target = http.createServer((req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ url: req.url, header: req.headers['x-proxy-test'], traceId: req.headers['x-request-id'] })); });
   const targetPort = await listen(target);
@@ -71,6 +93,23 @@ test('forwards HTTP requests with custom headers and a trace ID', async () => {
     assert.equal(runtime.lastSuccessAt > 0, true);
     assert.equal(runtime.clients[0].address, '127.0.0.1');
     assert.equal(runtime.recentEvents.some((event) => event.traceId === payload.traceId), true);
+    await manager.reload();
+    assert.equal(manager.snapshot().rules[store.rules()[0].id].clients[0].address, '127.0.0.1');
+    await manager.stopAll();
+    const restarted = new ProxyManager({ store, logger });
+    try {
+      await restarted.startAll();
+      const restored = restarted.snapshot().rules[store.rules()[0].id];
+      assert.equal(restored.requests, runtime.requests);
+      assert.equal(restored.connections, runtime.connections);
+      assert.equal(restored.bytesIn, runtime.bytesIn);
+      assert.equal(restored.bytesOut, runtime.bytesOut);
+      assert.equal(restored.activeConnections, 0);
+      assert.equal(restored.clients[0].active, 0);
+      assert.equal(restored.clients[0].address, '127.0.0.1');
+      assert.equal(restored.recentEvents.some((event) => event.traceId === payload.traceId), true);
+      assert.ok(!fs.readFileSync(path.join(directory, 'runtime-history.json'), 'utf8').includes('customHeaders'));
+    } finally { await restarted.stopAll(); }
   } finally {
     await manager.stopAll(); await close(target); fs.rmSync(directory, { recursive: true, force: true });
   }

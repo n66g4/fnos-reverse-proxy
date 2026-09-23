@@ -229,7 +229,7 @@ function Sidebar({ route, onNavigate, serviceState, version }) {
   const serviceDetail = serviceState === 'loading' ? '正在连接管理服务' : serviceState === 'healthy' ? '系统运行正常' : '请检查管理服务';
   return <aside className="sidebar">
     <div className="brand"><span className="brand-mark"><i className="bi bi-signpost-split-fill" aria-hidden="true" /></span><div><strong>反向代理管理器</strong><small>Reverse Proxy</small></div></div>
-    <nav className="nav-list" aria-label="主导航">{Object.entries(ROUTES).filter(([key]) => !['issuance', 'deployment'].includes(key)).map(([key, item]) => <button key={key} type="button" className={`nav-item${route === key || key === 'certificates' && ['issuance', 'deployment'].includes(route) ? ' active' : ''}`} aria-current={route === key ? 'page' : undefined} onClick={() => onNavigate(key)}><i className={`bi ${item.icon}`} aria-hidden="true" /><span>{item.label}</span></button>)}</nav>
+    <nav className="nav-list" aria-label="主导航">{Object.entries(ROUTES).filter(([key]) => !['issuance', 'deployment'].includes(key)).map(([key, item]) => <button key={key} type="button" className={`nav-item${route === key || key === 'certificates' && ['issuance', 'deployment'].includes(route) ? ' active' : ''}`} aria-label={item.label} aria-current={route === key ? 'page' : undefined} onClick={() => onNavigate(key)}><i className={`bi ${item.icon}`} aria-hidden="true" /><span className={key === 'certificates' ? 'nav-certificate-label' : undefined}>{item.label}</span>{key === 'certificates' ? <span className="nav-certificate-short" aria-hidden="true">证书</span> : null}</button>)}</nav>
     <footer className="sidebar-footer"><div className={`sidebar-health ${serviceState}`}><span><i className={`status-dot ${serviceState === 'healthy' ? 'online' : serviceState === 'loading' ? 'warning' : 'offline'}`} aria-hidden="true" />{serviceLabel}</span><small>{serviceDetail} · v{version || APP_VERSION}</small></div></footer>
   </aside>;
 }
@@ -292,7 +292,7 @@ function RuleActionMenu({ rule, pending, testUnavailable, onToggle: onRuleToggle
   </Popover.Root>;
 }
 
-function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDuplicate, onDelete, onTest, onBatch, busy }) {
+function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDuplicate, onDelete, onTest, onBatch, busy, toggleErrors }) {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
   const [selectionMode, setSelectionMode] = useState(false);
@@ -316,27 +316,33 @@ function RulesPage({ status, rules, runtime, onCreate, onEdit, onToggle, onDupli
   const allVisibleSelected = visible.length > 0 && visible.every((rule) => selected.has(rule.id));
   return <section className="view rules-view" aria-label="代理规则">
     <article className="matte-surface rules-surface">
-      <header className="rules-heading"><div><span>代理规则</span><StatusChip state={!status?.ok ? 'error' : status?.rules?.warning ? 'warning' : 'healthy'} label={!status?.ok ? '服务不可用' : status?.rules?.warning ? `${status.rules.warning} 个异常` : `${status?.rules?.healthy || 0} 个运行中`} /></div><span className="rules-heading-actions"><button type="button" className="secondary-button" onClick={() => selectionMode ? leaveSelection() : setSelectionMode(true)}><i className={`bi ${selectionMode ? 'bi-x-lg' : 'bi-check2-square'}`} aria-hidden="true" />{selectionMode ? '退出批量' : '批量管理'}</button><button type="button" className="primary-button" onClick={onCreate}><i className="bi bi-plus-lg" aria-hidden="true" />新建规则</button></span></header>
-      <div className="rules-toolbar"><div className="search-box"><i className="bi bi-search" aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索规则" placeholder="搜索名称、域名、IP 或端口" /></div><div className="filter-tabs" aria-label="规则筛选">{[['all', '全部'], ['enabled', '已启用'], ['http', 'HTTP'], ['tcp', 'TCP'], ['udp', 'UDP'], ['disabled', '已停用']].map(([value, label]) => <button type="button" key={value} className={filter === value ? 'active' : ''} aria-pressed={filter === value} onClick={() => setFilter(value)}>{label}</button>)}</div></div>
+      <header className="rules-heading"><div className="rules-title"><span className="section-kicker">REVERSE PROXY</span><h1>代理规则</h1><div className="rules-caption"><span>{rules.length} 条规则</span><StatusChip state={!status?.ok ? 'error' : status?.rules?.warning ? 'warning' : 'healthy'} label={!status?.ok ? '服务不可用' : status?.rules?.warning ? `${status.rules.warning} 个异常` : `${status?.rules?.healthy || 0} 个运行中`} /></div></div><span className="rules-heading-actions"><button type="button" className="secondary-button" onClick={() => selectionMode ? leaveSelection() : setSelectionMode(true)}><i className={`bi ${selectionMode ? 'bi-x-lg' : 'bi-check2-square'}`} aria-hidden="true" />{selectionMode ? '退出批量' : '批量管理'}</button><button type="button" className="primary-button" onClick={onCreate}><i className="bi bi-plus-lg" aria-hidden="true" />新建规则</button></span></header>
+      <div className="rules-toolbar"><div className="search-box"><i className="bi bi-search" aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="搜索规则" placeholder="搜索名称、域名、IP 或端口" /></div><div className="filter-tabs" aria-label="规则筛选">{[['all', '全部'], ['enabled', '已启用'], ['disabled', '已停用'], ['http', 'HTTP'], ['tcp', 'TCP'], ['udp', 'UDP']].map(([value, label]) => <button type="button" key={value} className={`${filter === value ? 'active' : ''}${value === 'http' ? ' protocol-filter-start' : ''}`} aria-pressed={filter === value} onClick={() => setFilter(value)}>{label}</button>)}</div></div>
       {selectionMode ? <div className="batch-bar"><label><input type="checkbox" checked={allVisibleSelected} onChange={() => setSelected((current) => { const next = new Set(current); visible.forEach((rule) => allVisibleSelected ? next.delete(rule.id) : next.add(rule.id)); return next; })} />选择当前 {visible.length} 条</label><span>已选 {selected.size} 条</span><div><button type="button" className="secondary-button" disabled={!selected.size || busy.has('batch-rules')} onClick={() => void runBatch('enable')}>启用</button><button type="button" className="secondary-button" disabled={!selected.size || busy.has('batch-rules')} onClick={() => void runBatch('disable')}>停用</button><button type="button" className="danger-button" disabled={!selected.size || busy.has('batch-rules')} onClick={() => void runBatch('delete')}>删除</button></div></div> : null}
-      <div className="rule-list" role="list">{visible.map((rule) => {
+      <div className="routing-cards" role="list">{visible.map((rule) => {
         const item = runtime?.[rule.id] || { state: rule.enabled ? 'starting' : 'disabled' };
         const protocols = ruleProtocols(rule);
         const targetProtocols = ruleTargetProtocols(rule);
         const universal = isUniversalPair(protocols, targetProtocols);
-        const pending = busy.has(rule.id);
+        const pending = busy.has(rule.id) || busy.has('batch-rules');
         const visibleState = pending ? 'starting' : item.state;
         const testUnavailable = !rule.enabled || ['disabled', 'scheduled', 'error', 'starting'].includes(item.state);
-        return <article className={`rule-item${selected.has(rule.id) ? ' selected' : ''}`} role="listitem" key={rule.id}>
-          {selectionMode ? <label className="batch-selector" title={`选择 ${rule.name}`}><input type="checkbox" checked={selected.has(rule.id)} onChange={() => toggleSelected(rule.id)} aria-label={`选择 ${rule.name}`} /></label> : null}
-          <button type="button" className="rule-flow" onClick={() => selectionMode ? toggleSelected(rule.id) : onEdit(rule)} aria-label={`${selectionMode ? '选择' : '编辑'}规则 ${rule.name}；${universal ? 'TCP、UDP 原样转发' : `协议 ${protocols.map((protocol) => protocolLabels[protocol]).join('、')}`}；来源 ${rule.listenHost}:${portListLabel(rule, 'listen')}；目标 ${rule.targetHost}:${portListLabel(rule, 'target')}；状态 ${stateLabels[visibleState] || visibleState}`}>
-            <span className="rule-identity"><ProtocolBadges protocols={protocols} /><span><strong>{rule.name}</strong><small>{universal ? 'TCP + UDP 原样转发' : (rule.domains || []).length ? rule.domains.join('、') : protocols.map((protocol) => protocolLabels[protocol]).join(' · ')}</small></span></span>
-            <span className="flow-endpoint source"><small>来源</small><code>{rule.listenHost === '0.0.0.0' ? '所有地址' : rule.listenHost}<b>:{portListLabel(rule, 'listen')}</b></code></span>
-            <span className="flow-arrow"><i className="bi bi-arrow-right" aria-hidden="true" /></span>
-            <span className="flow-endpoint target"><small>{universal ? '原样转发' : targetProtocols.map((protocol) => protocol.toUpperCase()).join(' · ')}</small><code>{rule.targetHost}<b>:{portListLabel(rule, 'target')}</b></code></span>
-            <span className="rule-state"><StatusChip state={visibleState} message={pending ? '正在等待服务器确认' : item.message} />{pending ? <small>正在等待服务器确认</small> : item.message && !['healthy', 'disabled'].includes(item.state) ? <small>{item.message}</small> : <small>{item.activeConnections || 0} 当前 · {item.connections || 0} 累计</small>}</span>
+        return <article className={`routing-card${selected.has(rule.id) ? ' selected' : ''}${!rule.enabled ? ' is-disabled' : ''}`} role="listitem" key={rule.id} aria-label={rule.name} aria-busy={pending}>
+          <header className="routing-card-header">
+            {selectionMode ? <label className="routing-selection"><input type="checkbox" checked={selected.has(rule.id)} disabled={pending} onChange={() => toggleSelected(rule.id)} aria-label={`选择 ${rule.name}`} /></label> : null}
+            <button type="button" className="routing-identity" onClick={() => selectionMode ? toggleSelected(rule.id) : onEdit(rule)} aria-label={`${selectionMode ? '选择' : '编辑'}规则 ${rule.name}`}>
+              <span className={`routing-icon ${protocols[0]}`}><i className={`bi ${protocols.includes('https') || protocols.includes('wss') ? 'bi-shield-lock' : protocols.includes('http') || protocols.includes('ws') ? 'bi-globe2' : 'bi-arrow-left-right'}`} aria-hidden="true" /></span>
+              <span><strong>{rule.name}</strong><small>{universal ? 'TCP + UDP 原样转发' : (rule.domains || []).length ? rule.domains.join('、') : protocols.map((protocol) => protocolLabels[protocol]).join(' · ')}</small></span>
+            </button>
+            <div className="routing-switch"><Toggle checked={rule.enabled} label={`${rule.enabled ? '关闭' : '开启'}规则 ${rule.name}`} disabled={pending} onChange={(enabled) => onToggle(rule, enabled)} /><span>{pending ? '处理中' : rule.enabled ? '已开启' : '已关闭'}</span></div>
+          </header>
+          <button type="button" className="routing-path" onClick={() => selectionMode ? toggleSelected(rule.id) : onEdit(rule)} aria-label={`查看${rule.name}的转发配置；来源 ${rule.listenHost}:${portListLabel(rule, 'listen')}；目标 ${rule.targetHost}:${portListLabel(rule, 'target')}`}>
+            <span className="routing-endpoint"><span className="routing-endpoint-label">来源 <ProtocolBadges protocols={protocols} /></span><code>{rule.listenHost === '0.0.0.0' ? '所有地址' : rule.listenHost}</code><strong>:{portListLabel(rule, 'listen')}</strong></span>
+            <span className="routing-direction"><i className="bi bi-arrow-right" aria-hidden="true" /></span>
+            <span className="routing-endpoint"><span className="routing-endpoint-label">目标 <ProtocolBadges protocols={targetProtocols} /></span><code>{rule.targetHost}</code><strong>:{portListLabel(rule, 'target')}</strong></span>
           </button>
-          {!selectionMode ? <RuleActionMenu rule={rule} pending={pending} testUnavailable={testUnavailable} onToggle={onToggle} onTest={onTest} onDetails={setDetailsRule} onEdit={onEdit} onDuplicate={onDuplicate} onDelete={onDelete} /> : null}
+          <footer className="routing-card-footer"><div className="routing-health"><StatusChip state={visibleState} message={pending ? '正在等待服务器确认' : item.message} /><small>{pending ? '正在等待服务器确认' : item.message && !['healthy', 'disabled'].includes(item.state) ? item.message : !rule.enabled ? '开启后开始转发' : `${item.activeConnections || 0} 当前连接 · ${item.connections || 0} 累计`}</small></div><RuleActionMenu rule={rule} pending={pending} testUnavailable={testUnavailable} onToggle={onToggle} onTest={onTest} onDetails={setDetailsRule} onEdit={onEdit} onDuplicate={onDuplicate} onDelete={onDelete} /></footer>
+          {toggleErrors[rule.id] && !pending ? <p className="routing-error" role="alert"><i className="bi bi-exclamation-circle" aria-hidden="true" /><span>{toggleErrors[rule.id]}</span></p> : null}
         </article>;
       })}{!visible.length ? <EmptyState icon="bi-inboxes" title="没有符合条件的规则" description="调整搜索或筛选条件，或者新建一条规则。" action="新建规则" onAction={onCreate} /> : null}</div>
     </article><RuntimeDialog rule={detailsRule} runtime={detailsRule ? runtime?.[detailsRule.id] : null} onClose={() => setDetailsRule(null)} />
@@ -855,6 +861,7 @@ export function App() {
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(() => new Set());
+  const [toggleErrors, setToggleErrors] = useState({});
   const [toast, setToast] = useState(null);
   const [ruleDialog, setRuleDialog] = useState({ open: false, rule: null });
   const [certificateOpen, setCertificateOpen] = useState(false);
@@ -1063,12 +1070,20 @@ export function App() {
     else notify(editing ? '规则已更新并应用' : draft.enabled ? '规则已创建并开始监听' : '规则已创建，当前保持停用');
     await loadCore(true);
   }, () => loadCore(true));
-  const toggleRule = (rule, enabled) => withBusy(rule.id, async () => {
+  const toggleRule = async (rule, enabled) => {
+    if (busyRef.current.has(rule.id) || busyRef.current.has('batch-rules')) return;
+    setToggleErrors((current) => { const next = { ...current }; delete next[rule.id]; return next; });
+    const outcome = await withBusy(rule.id, async () => {
     const result = await api(`/rules/${rule.id}/toggle`, { method: 'POST', body: { enabled } });
     if (enabled && result.runtime && !['healthy', 'scheduled'].includes(result.runtime.state)) notify(`规则已启用，但启动失败：${result.runtime.message || '请检查配置'}`, 'error');
     else notify(enabled ? '规则已启用' : '规则已停用');
     await loadCore(true);
-  }, () => loadCore(true));
+    }, () => loadCore(true));
+    if (outcome !== true && !outcome.pending) {
+      setToggleErrors((current) => ({ ...current, [rule.id]: `${enabled ? '开启' : '关闭'}${outcome.error?.uncertain ? '结果待确认' : '失败'}：${errorText(outcome.error)}` }));
+    }
+    return outcome;
+  };
   const duplicateRule = (rule) => withBusy(rule.id, async () => { await api(`/rules/${rule.id}/duplicate`, { method: 'POST' }); notify('已创建停用状态的规则副本'); await loadCore(true); }, () => loadCore(true));
   const batchRules = (ids, action) => {
     if (action === 'delete' && !window.confirm(`确定删除选中的 ${ids.length} 条规则吗？此操作无法撤销。`)) return Promise.resolve({ ok: false, cancelled: true });
@@ -1192,7 +1207,7 @@ export function App() {
   const serviceState = resources.status.loading && !resources.status.hasData ? 'loading' : resources.status.hasData && status?.ok ? 'healthy' : 'error';
 
   let page = null;
-  if (route === 'rules') page = <RulesPage status={status} rules={rules} runtime={runtime} busy={busy} onCreate={() => setRuleDialog({ open: true, rule: null })} onEdit={(rule) => setRuleDialog({ open: true, rule })} onToggle={toggleRule} onDuplicate={duplicateRule} onDelete={deleteRule} onTest={testRule} onBatch={batchRules} />;
+  if (route === 'rules') page = <RulesPage status={status} rules={rules} runtime={runtime} busy={busy} toggleErrors={toggleErrors} onCreate={() => setRuleDialog({ open: true, rule: null })} onEdit={(rule) => setRuleDialog({ open: true, rule })} onToggle={toggleRule} onDuplicate={duplicateRule} onDelete={deleteRule} onTest={testRule} onBatch={batchRules} />;
   if (route === 'certificates') page = <CertificatesPage certificates={certificates} systemSource={certificateSources.system} certificatePush={certificatePush} rules={rules} rulesAvailable={resources.rules.hasData} systemReloading={busy.has('reload-system-certificates')} pushBusy={busy.has('certificate-push')} onCreate={() => { setReplacementCertificate(null); setCertificateOpen(true); }} onReplace={(certificate) => { setReplacementCertificate(certificate); setCertificateOpen(true); }} onDelete={deleteCertificate} onReloadSystem={() => void reloadSystemCertificates()} onRotatePush={rotateCertificatePush} onDisablePush={() => void disableCertificatePush()} />;
   if (route === 'ddns') page = <DdnsPage integration={ddns} busy={busy.has('ddns') || ddns.running} detectBusy={busy.has('ddns-detect')} onDetect={(type) => void detectDdns(type)} onSave={saveDdns} onSync={() => void syncDdns()} onTest={() => void testDdns()} />;
   if (route === 'deployment') page = <FnosDeploymentPage onImport={() => { setReplacementCertificate(null); setCertificateOpen(true); }} integration={deployment} certificates={certificates} busy={busy.has('deployment') || deployment.running} onSave={saveDeployment} onRefresh={() => void refreshDeployment()} onPrepare={prepareDeployment} onDeploy={deployToFnos} onCertificates={() => navigate('certificates')} />;

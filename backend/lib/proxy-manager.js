@@ -5,6 +5,7 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import fs from 'node:fs';
+import path from 'node:path';
 import { Transform } from 'node:stream';
 import tls from 'node:tls';
 import httpProxy from 'http-proxy';
@@ -278,7 +279,7 @@ function runtimeFor(rule, seed = null) {
     lastErrorAt: preserved.lastErrorAt,
     lastError: preserved.lastError,
     recentEvents: Array.isArray(seed?.recentEvents) ? seed.recentEvents.slice(0, 30) : [],
-    clients: new Map(),
+    clients: new Map((seed?.clients instanceof Map ? [...seed.clients.values()] : Array.isArray(seed?.clients) ? seed.clients : []).slice(0, 80).map((client) => [`${client.protocol}:${client.address}`, { ...client, active: 0 }])),
     servers: [],
     closers: [],
     sockets: new Set(),
@@ -336,6 +337,48 @@ export class ProxyManager {
     this.runtimes = new Map();
     this.healthTimer = null;
     this.lifecycle = Promise.resolve();
+    this.historyFile = store.dataDir && !demoMode ? path.join(store.dataDir, 'runtime-history.json') : null;
+    this.historyTimer = null;
+    this.historyError = '';
+    this.history = this.readHistory();
+  }
+
+  readHistory() {
+    if (!this.historyFile) return new Map();
+    try {
+      const saved = JSON.parse(fs.readFileSync(this.historyFile, 'utf8'));
+      if (saved.version !== 1 || !saved.rules || typeof saved.rules !== 'object') throw new Error('运行历史格式无效');
+      return new Map(this.store.rules().filter((rule) => saved.rules[rule.id]).map((rule) => {
+        const source = saved.rules[rule.id];
+        const metrics = Object.fromEntries(metricFields.map((field) => [field, field === 'lastError' ? (typeof source[field] === 'string' ? source[field].slice(0, 2000) : null) : Number.isFinite(source[field]) && source[field] >= 0 ? source[field] : null]));
+        return [rule.id, { ...metrics, recentEvents: Array.isArray(source.recentEvents) ? source.recentEvents.filter((event) => event && typeof event.id === 'string' && typeof event.message === 'string').slice(0, 30) : [], clients: Array.isArray(source.clients) ? source.clients.filter((client) => client && typeof client.address === 'string' && typeof client.protocol === 'string').slice(0, 80) : [] }];
+      }));
+    } catch (error) {
+      if (error.code !== 'ENOENT') this.logger.warn('运行历史无法读取，将重新记录', { error: error.message });
+      return new Map();
+    }
+  }
+
+  saveHistory() {
+    if (!this.historyFile) return;
+    const rules = Object.fromEntries(this.store.rules().map((rule) => {
+      const runtime = this.runtimes.get(rule.id) || this.history.get(rule.id);
+      if (!runtime) return null;
+      return [rule.id, {
+        ...Object.fromEntries(metricFields.map((field) => [field, runtime[field]])),
+        recentEvents: runtime.recentEvents.slice(0, 30),
+        clients: (runtime.clients instanceof Map ? [...runtime.clients.values()] : runtime.clients || []).slice(0, 80).map((client) => ({ ...client, active: 0 })),
+      }];
+    }).filter(Boolean));
+    try {
+      fs.writeFileSync(`${this.historyFile}.tmp`, JSON.stringify({ version: 1, rules }), { mode: 0o600 });
+      fs.renameSync(`${this.historyFile}.tmp`, this.historyFile);
+      this.history = new Map(Object.entries(rules));
+      this.historyError = '';
+    } catch (error) {
+      if (this.historyError !== error.message) this.logger.warn('运行历史保存失败', { error: error.message });
+      this.historyError = error.message;
+    }
   }
 
   runLifecycle(operation) {
@@ -345,7 +388,7 @@ export class ProxyManager {
   }
 
   async startAllNow() {
-    const seeds = new Map([...this.runtimes.entries()].map(([id, runtime]) => [id, runtime]));
+    const seeds = new Map([...this.history, ...this.runtimes]);
     await this.stopAllNow();
     const failures = [];
     for (const rule of this.store.rules()) {
@@ -356,6 +399,11 @@ export class ProxyManager {
       else this.runtimes.set(rule.id, { ...runtimeFor(rule, seeds.get(rule.id)), state: 'disabled', message: '已停用' });
     }
     this.scheduleHealthChecks();
+    this.saveHistory();
+    if (this.historyFile) {
+      this.historyTimer = setInterval(() => this.saveHistory(), 15000);
+      this.historyTimer.unref?.();
+    }
     return { ok: failures.length === 0, failures, runtime: this.snapshot() };
   }
 
@@ -454,9 +502,12 @@ export class ProxyManager {
   }
 
   async stopAllNow() {
+    clearInterval(this.historyTimer);
+    this.historyTimer = null;
     clearInterval(this.healthTimer);
     this.healthTimer = null;
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => this.closeRuntime(runtime)));
+    this.saveHistory();
     this.runtimes.clear();
   }
 
