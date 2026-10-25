@@ -2,7 +2,7 @@
 
 面向飞牛 fnOS 的原生多协议反向代理应用。界面采用 iOS 18 风格的柔和磨砂质感，会随系统自动切换亮色或暗色，并同时适配桌面端和移动端。代理规则以卡片呈现，直接显示来源到目标的映射和快捷启停开关。
 
-项目地址：<https://github.com/BearHero520/fnos-reverse-proxy>
+项目地址：<https://github.com/n66g4/fnos-reverse-proxy>
 
 当前源码版本：**1.0.18**。
 
@@ -55,4 +55,4 @@ Web 和代理进程以独立 fnOS 应用用户运行，仅申请监听低端口�
 
 阿里云 V2 自动化不会替用户领取实例；额度耗尽时停止。DDNS 只更新解析记录，不解决运营商 CGNAT 或公网入站限制。
 
-Copyright © 2026 BearHero. All rights reserved.
+Copyright © 2026 Gen. All rights reserved.

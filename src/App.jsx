@@ -18,7 +18,7 @@ const ROUTES = {
   about: { label: '关于', icon: 'bi-info-circle', title: '关于', description: '查看版本、项目地址与许可信息。' },
 };
 
-const PROJECT_URL = 'https://github.com/BearHero520/fnos-reverse-proxy';
+const PROJECT_URL = 'https://github.com/n66g4/fnos-reverse-proxy';
 
 
 const blankRule = {
@@ -825,7 +825,7 @@ function AboutPage({ version }) {
     <dl className="about-list">
       <div><dt>版本</dt><dd>{version || APP_VERSION}</dd></div>
       <div><dt>项目地址</dt><dd><a href={PROJECT_URL} target="_blank" rel="noreferrer">{PROJECT_URL}<i className="bi bi-box-arrow-up-right" aria-hidden="true" /></a></dd></div>
-      <div><dt>许可</dt><dd>Copyright © 2026 BearHero</dd></div>
+      <div><dt>许可</dt><dd>Copyright © 2026 Gen</dd></div>
     </dl>
   </article></section>;
 }
