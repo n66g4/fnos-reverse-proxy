@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { ConfigStore, isRuleScheduleOpen, normalizeRule, parseHeaders, parsePortSpec, targetPortFor, validateRule, validateTargetSafety } from '../lib/config-store.js';
+import { ConfigStore, isRuleScheduleOpen, normalizeRule, parseHeaders, parsePortSpec, targetPortFor, validateRule, validateTargetSafety, withConfigFileLock } from '../lib/config-store.js';
 
 test('normalizes list fields and header text', () => {
   const rule = normalizeRule({ name: 'Web', domains: 'a.test, b.test\na.test', customHeaders: 'X-App: proxy\nX-Mode: safe' });
@@ -15,6 +15,19 @@ test('detects conflicting TCP-family listeners', () => {
   const existing = normalizeRule({ name: 'HTTP', protocol: 'http', listenPort: 8080 });
   const next = normalizeRule({ name: 'TCP', protocol: 'tcp', listenPort: 8080 });
   assert.throws(() => validateRule(next, [existing]), /监听地址/);
+});
+
+test('allows HTTPS rules to share a port when their domains do not overlap', () => {
+  const certificates = { certificateIds: new Set(['cert']) };
+  const git = normalizeRule({ name: 'Git', protocols: ['https'], listenPort: 443, domains: ['git.example.com'], targetProtocols: ['http'], tls: { certId: 'cert' } });
+  const nas = normalizeRule({ name: 'Nas', protocols: ['https'], listenPort: 443, domains: ['nas.example.com'], targetProtocols: ['http'], tls: { certId: 'cert' } });
+  assert.doesNotThrow(() => validateRule(nas, [git], certificates));
+  const duplicate = normalizeRule({ name: 'Duplicate', protocols: ['https'], listenPort: 443, domains: ['git.example.com'], targetProtocols: ['http'], tls: { certId: 'cert' } });
+  assert.throws(() => validateRule(duplicate, [git], certificates), /冲突/);
+  const wildcard = normalizeRule({ name: 'Wild', protocols: ['https'], listenPort: 443, domains: ['*.example.com'], targetProtocols: ['http'], tls: { certId: 'cert' } });
+  assert.throws(() => validateRule(nas, [wildcard], certificates), /冲突/);
+  const open = normalizeRule({ name: 'Open', protocols: ['https'], listenPort: 443, domains: [], targetProtocols: ['http'], tls: { certId: 'cert' } });
+  assert.throws(() => validateRule(nas, [open], certificates), /冲突/);
 });
 
 test('allows TCP and UDP on the same numeric port', () => {
@@ -198,9 +211,16 @@ test('keeps Cloudflare and ACME secrets write-only while preserving saved creden
     const retained = store.updateDdns({ intervalMinutes: 30 });
     assert.equal(store.ddnsConfig().apiToken, 'cloudflare-secret-token');
     assert.equal(retained.intervalMinutes, 30);
-    store.patchIssuance('acme', { accountKeyPem: 'private-account-key' });
+    store.patchIssuance('acme', { accountKeyPem: 'private-account-key', freednsPassword: 'freedns-secret', freednsSessionCookie: 'dns_cookie=secret', eabHmacKey: 'eab-secret' });
     assert.equal(store.issuanceStatus().acme.hasAccount, true);
-    assert.equal(JSON.stringify(store.issuanceStatus()).includes('private-account-key'), false);
+    assert.equal(store.issuanceStatus().acme.hasFreednsPassword, true);
+    assert.equal(store.issuanceStatus().acme.hasFreednsSession, true);
+    assert.equal(store.issuanceStatus().acme.hasEabHmacKey, true);
+    const publicJson = JSON.stringify(store.issuanceStatus());
+    for (const secret of ['private-account-key', 'freedns-secret', 'dns_cookie=secret', 'eab-secret']) {
+      assert.equal(publicJson.includes(secret), false);
+    }
+    assert.equal(JSON.stringify(store.exportConfig()).includes('freedns-secret'), false);
     assert.throws(() => store.updateDdns({ zoneId: 'bad', enabled: true }), /Zone ID/);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -247,4 +267,57 @@ test('persists CRUD operations atomically', () => {
   reloaded.deleteRule(created.id);
   assert.equal(reloaded.rules().length, 0);
   fs.rmSync(directory, { recursive: true, force: true });
+});
+
+test('save clears a stale lock left by a dead process', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-store-'));
+  try {
+    const store = new ConfigStore(directory);
+    store.load();
+    const lockPath = `${store.file}.lock`;
+    fs.writeFileSync(lockPath, `1999999999\n${Date.now() - 60_000}\n`, { flag: 'wx', mode: 0o600 });
+    store.data.settings.logLevel = 'warn';
+    assert.doesNotThrow(() => store.save());
+    assert.equal(fs.existsSync(lockPath), false);
+    assert.equal(JSON.parse(fs.readFileSync(store.file, 'utf8')).settings.logLevel, 'warn');
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('live holder lock is not stolen by age; busy wait times out', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-lock-'));
+  try {
+    const lockPath = path.join(directory, 'config.json.lock');
+    fs.writeFileSync(lockPath, `${process.pid}\n${Date.now() - 60_000}\n`, { flag: 'wx', mode: 0o600 });
+    assert.throws(() => withConfigFileLock(lockPath, () => {}, { timeoutMs: 60 }), /繁忙/);
+    assert.equal(fs.existsSync(lockPath), true);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('nested save during write coalesces without deadlocking the lock file', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-store-'));
+  const rename = fs.renameSync;
+  try {
+    const store = new ConfigStore(directory);
+    store.load();
+    let nested = false;
+    fs.renameSync = (...args) => {
+      if (!nested && args[1] === store.file) {
+        nested = true;
+        store.data.settings.logLevel = 'debug';
+        store.save();
+      }
+      return rename(...args);
+    };
+    store.save();
+    assert.equal(nested, true);
+    assert.equal(fs.existsSync(`${store.file}.lock`), false);
+    assert.equal(JSON.parse(fs.readFileSync(store.file, 'utf8')).settings.logLevel, 'debug');
+  } finally {
+    fs.renameSync = rename;
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });

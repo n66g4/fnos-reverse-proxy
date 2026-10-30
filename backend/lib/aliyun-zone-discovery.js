@@ -1,7 +1,7 @@
 import AliDns from '@alicloud/alidns20150109';
 import OpenApi from '@alicloud/openapi-client';
 import Tea from '@alicloud/tea-util';
-import { validDomain } from './automation-config.js';
+import { validDomain, legacyView } from './automation-config.js';
 import { automationError } from './aliyun-client.js';
 
 const clean = (value) => typeof value === 'string' ? value.trim() : '';
@@ -37,7 +37,21 @@ export class AliyunZoneDiscovery {
     if (!['certificate-issuance', 'ddns'].includes(scope)) throw automationError('不支持的解析区域查询来源');
     if (!input || typeof input !== 'object' || Array.isArray(input)) throw automationError('解析区域查询参数无效');
     const candidates = zoneCandidates(input.domain);
-    const saved = (scope === 'ddns' ? this.store.ddnsConfig() : this.store.issuanceConfig()).aliyun;
+    const saved = scope === 'ddns'
+      ? (() => {
+        const config = this.store.ddnsConfig();
+        const task = input.taskId ? config.tasks?.find((item) => item.id === input.taskId) : config.tasks?.find((item) => item.provider === 'aliyun' || item.provider === 'aliyun_esa');
+        if (task?.credentials) {
+          return {
+            accessKeyId: task.credentials.accessKeyId || '',
+            accessKeySecret: task.credentials.accessKeySecret || '',
+            dnsZone: task.credentials.dnsZone || '',
+            line: task.credentials.line || 'default',
+          };
+        }
+        return legacyView(config).aliyun;
+      })()
+      : this.store.issuanceConfig().aliyun;
     const accessKeyId = clean(input.accessKeyId ?? saved.accessKeyId);
     const suppliedSecret = clean(input.accessKeySecret);
     if (accessKeyId !== saved.accessKeyId && !suppliedSecret && !input.clearAccessKeySecret) throw automationError('更换 AccessKey ID 后，请同时填写对应的新 Secret');

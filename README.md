@@ -15,8 +15,8 @@
 - 域名、请求头、真实 IP、访问控制、超时、上传限制、HSTS 和目标证书校验
 - 规则内直接选择、上传或申请 HTTPS 证书；替换证书时保留规则绑定
 - 阿里云中国站免费证书 V1/V2 自动申请、AliDNS 验证、进度日志及临期轮换；仅使用可用免费额度或已领取实例，不购买付费套餐
-- Let’s Encrypt / ACME，通过独立 Cloudflare 凭据完成 DNS-01 验证
-- Cloudflare、阿里云 DNS、腾讯云 DNSPod DDNS，支持 NAS 侧公网 IPv4/IPv6 检测
+- Let’s Encrypt / ZeroSSL（ACME），DNS-01 支持 Cloudflare 与 FreeDNS（见 [docs/acme-dns-issuance.md](docs/acme-dns-issuance.md)）
+- 应用内 DDNS（对齐 DDNS-Go）：多任务、多服务商、双栈、接口/网卡/命令取 IP、Webhook/Callback、近 50 条日志
 - 系统 HTTPS 证书替换集成于“域名与证书”，支持预检、确认、备份、验证及失败回退（实验性）
 - Webhook 通知、局域网目标发现、配置导入导出、运行日志和诊断包
 

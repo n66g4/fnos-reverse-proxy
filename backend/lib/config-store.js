@@ -4,7 +4,7 @@ import { validateHeaderName, validateHeaderValue } from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { sanitizeCertificate } from './system-certificate-store.js';
-import { normalizeDdns, defaultIssuance, migrateDomainAutomation, publicDdns, publicIssuance, updateDdnsConfig, updateIssuanceConfig } from './automation-config.js';
+import { normalizeDdns, defaultIssuance, migrateDomainAutomation, publicDdns, publicIssuance, updateDdnsConfig, updateIssuanceConfig, appendDdnsLog, legacyView } from './automation-config.js';
 
 export const SOURCE_PROTOCOLS = new Set(['http', 'ws', 'https', 'wss', 'tcp', 'udp']);
 export const TARGET_PROTOCOLS = new Set(['http', 'ws', 'https', 'wss', 'tcp', 'udp']);
@@ -266,7 +266,7 @@ export function normalizeRule(input = {}, existing = null) {
   };
 }
 
-function normalizedListenHost(value) {
+export function normalizedListenHost(value) {
   const host = text(value).toLowerCase().replace(/^\[|\]$/g, '');
   if (host === '0:0:0:0:0:0:0:0') return '::';
   return host;
@@ -321,6 +321,45 @@ export function transportSet(ruleOrProtocols) {
   return new Set(sourceGroups(protocols).map((protocol) => protocol === 'udp' ? 'udp' : 'tcp'));
 }
 
+function webFamily(rule) {
+  const groups = sourceGroups(rule.protocols).filter((protocol) => protocol !== 'udp');
+  return groups.length === 1 && (groups[0] === 'http' || groups[0] === 'https') ? groups[0] : null;
+}
+
+function domainPatternMatches(pattern, host) {
+  const name = String(pattern || '').toLowerCase().replace(/\.$/, '');
+  const value = String(host || '').toLowerCase().replace(/\.$/, '');
+  if (name.startsWith('*.')) return value.endsWith(name.slice(1));
+  return value === name;
+}
+
+function domainPatternsOverlap(left, right) {
+  const a = String(left || '').toLowerCase().replace(/\.$/, '');
+  const b = String(right || '').toLowerCase().replace(/\.$/, '');
+  if (a === b) return true;
+  if (a.startsWith('*.') && b.startsWith('*.')) {
+    const as = a.slice(1);
+    const bs = b.slice(1);
+    return as.endsWith(bs) || bs.endsWith(as);
+  }
+  if (a.startsWith('*.')) return domainPatternMatches(a, b);
+  if (b.startsWith('*.')) return domainPatternMatches(b, a);
+  return false;
+}
+
+function domainListsOverlap(left = [], right = []) {
+  if (!left.length || !right.length) return true;
+  return left.some((item) => right.some((other) => domainPatternsOverlap(item, other)));
+}
+
+function canShareWebPort(current, rule) {
+  const family = webFamily(current);
+  if (!family || family !== webFamily(rule)) return false;
+  if (normalizedListenHost(current.listenHost) !== normalizedListenHost(rule.listenHost)) return false;
+  if (!current.domains?.length || !rule.domains?.length) return false;
+  return !domainListsOverlap(current.domains, rule.domains);
+}
+
 export function validateRule(rule, rules = [], { certificateIds = null, allowMissingCertificate = false } = {}) {
   const errors = [];
   if (!rule.name) errors.push('请输入规则名称');
@@ -357,7 +396,7 @@ export function validateRule(rule, rules = [], { certificateIds = null, allowMis
     if (!listenHostsOverlap(current.listenHost, rule.listenHost)) continue;
     if (!listenPortsFor(current).some((port) => listenSet.has(port))) continue;
     const overlaps = [...transportSet(current)].some((item) => transports.has(item));
-    if (overlaps) errors.push(`监听地址与规则“${current.name}”冲突`);
+    if (overlaps && !canShareWebPort(current, rule)) errors.push(`监听地址与规则“${current.name}”冲突`);
   }
   if (errors.length) {
     const error = new Error(errors.join('；'));
@@ -411,6 +450,63 @@ function demoRules() {
   ];
 }
 
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleepMs(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const end = Date.now() + ms;
+    while (Date.now() < end) { /* spin */ }
+  }
+}
+
+/** Exclusive lock around config.json writers. Stale only when holder PID is dead (never age-steal a live holder). */
+export function withConfigFileLock(lockPath, fn, { timeoutMs = 30_000 } = {}) {
+  const started = Date.now();
+  for (;;) {
+    let fd;
+    try {
+      fd = fs.openSync(lockPath, 'wx', 0o600);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let stale = false;
+      try {
+        const pid = Number.parseInt(fs.readFileSync(lockPath, 'utf8').split('\n')[0], 10);
+        stale = !pidAlive(pid);
+      } catch {
+        stale = true;
+      }
+      if (stale) {
+        try { fs.unlinkSync(lockPath); } catch { /* raced */ }
+        continue;
+      }
+      if (Date.now() - started >= timeoutMs) {
+        const busy = new Error('配置保存繁忙，请稍后重试');
+        busy.status = 503;
+        throw busy;
+      }
+      sleepMs(20);
+      continue;
+    }
+    try {
+      fs.writeFileSync(fd, `${process.pid}\n${Date.now()}\n`);
+      return fn();
+    } finally {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+      try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+    }
+  }
+}
+
 export class ConfigStore {
   constructor(dataDir, { demoMode = false, systemCertificates = null, localHosts = [], reservedPorts = [] } = {}) {
     this.dataDir = dataDir;
@@ -421,6 +517,8 @@ export class ConfigStore {
     this.localHosts = localHosts;
     this.reservedPorts = reservedPorts;
     this.data = null;
+    this._saving = false;
+    this._saveQueued = false;
   }
 
   load() {
@@ -456,10 +554,44 @@ export class ConfigStore {
   }
 
   save() {
-    fs.mkdirSync(this.dataDir, { recursive: true });
-    const temporary = `${this.file}.tmp`;
-    fs.writeFileSync(temporary, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
-    fs.renameSync(temporary, this.file);
+    // Coalesce re-entrant save() (e.g. migration during load) so the lock is not double-acquired.
+    if (this._saving) {
+      this._saveQueued = true;
+      return;
+    }
+    this._saving = true;
+    try {
+      do {
+        this._saveQueued = false;
+        fs.mkdirSync(this.dataDir, { recursive: true });
+        const temporary = `${this.file}.tmp`;
+        // Snapshot after any nested mutations queued during the previous attempt.
+        const payload = `${JSON.stringify(this.data, null, 2)}\n`;
+        try {
+          withConfigFileLock(`${this.file}.lock`, () => {
+            fs.writeFileSync(temporary, payload, { mode: 0o600 });
+            fs.renameSync(temporary, this.file);
+          });
+        } catch (error) {
+          // Memory already holds the latest config; defer disk write instead of throwing and
+          // leaving callers with a silent memory/disk split after a mutate+save path.
+          if (error?.status === 503) {
+            this._saveQueued = true;
+            if (!this._saveRetry) {
+              this._saveRetry = setTimeout(() => {
+                this._saveRetry = null;
+                try { this.save(); } catch { /* next defer */ }
+              }, 200);
+              this._saveRetry.unref?.();
+            }
+            return;
+          }
+          throw error;
+        }
+      } while (this._saveQueued);
+    } finally {
+      this._saving = false;
+    }
   }
 
   rules() { return this.data.rules.map((rule) => ({ ...rule })); }
@@ -693,19 +825,57 @@ export class ConfigStore {
     this.save();
   }
 
-  ddnsConfig() { return normalizeDdns(this.data.integrations?.ddns); }
+  ddnsConfig() {
+    const normalized = normalizeDdns(this.data.integrations?.ddns);
+    // Persist migration from flat v1 so subsequent loads stay on v2.
+    if (this.data.integrations && JSON.stringify(this.data.integrations.ddns || {}) !== JSON.stringify(normalized)) {
+      this.data.integrations.ddns = normalized;
+      this.save();
+    }
+    // Include legacy flat mirrors (provider/recordName/aliyun/...) for older callers and tests.
+    return legacyView(normalized);
+  }
   ddnsStatus() { return publicDdns(this.ddnsConfig()); }
   updateDdns(input = {}) {
-    this.data.integrations.ddns = updateDdnsConfig(this.ddnsConfig(), input);
+    // Always RMW the live v2 document — not legacyView — so sibling tasks stay intact.
+    this.data.integrations.ddns = updateDdnsConfig(normalizeDdns(this.data.integrations?.ddns), input);
     this.save();
     return this.ddnsStatus();
   }
-  recordDdnsResult({ ok, ip = null, changed = null, error = null }) {
-    const config = this.ddnsConfig();
-    config.lastRunAt = now();
-    config.lastError = ok ? null : text(error, 'DDNS 同步失败');
-    if (ok) { config.lastSuccessAt = config.lastRunAt; config.lastIp = ip || config.lastIp; config.lastChanged = changed; }
-    this.data.integrations.ddns = config;
+  recordDdnsResult({ ok, ip = null, ipv4 = null, ipv6 = null, changed = null, error = null, taskId = null }) {
+    // Patch the live v2 document only (runtime + logs). Never rewrite from a
+    // detached legacyView snapshot, so concurrent updateDdns task edits survive.
+    const live = normalizeDdns(this.data.integrations?.ddns);
+    const stamp = now();
+    const task = (taskId && live.tasks.find((item) => item.id === taskId)) || live.tasks.find((item) => item.enabled) || live.tasks[0];
+    if (task) {
+      task.lastRunAt = stamp;
+      task.lastError = ok ? null : text(error, 'DDNS 同步失败');
+      if (ok) {
+        task.lastSuccessAt = stamp;
+        task.lastChanged = changed;
+        if (ipv4) task.lastIpv4 = ipv4;
+        if (ipv6) task.lastIpv6 = ipv6;
+        if (ip && !ipv4 && !ipv6) {
+          if (task.ipv6?.enabled && !task.ipv4?.enabled) task.lastIpv6 = ip;
+          else task.lastIpv4 = ip;
+        }
+      }
+    }
+    this.data.integrations.ddns = appendDdnsLog(live, {
+      at: stamp,
+      level: ok ? 'info' : 'error',
+      message: ok ? `同步成功${ip ? ` · ${ip}` : ''}${changed ? '（已更新）' : '（未变化）'}` : text(error, 'DDNS 同步失败'),
+    });
+    this.save();
+  }
+
+  appendDdnsLogEntry(entry = {}) {
+    this.data.integrations.ddns = appendDdnsLog(normalizeDdns(this.data.integrations?.ddns), {
+      at: entry.at || now(),
+      level: entry.level,
+      message: entry.message,
+    });
     this.save();
   }
   issuanceConfig() {

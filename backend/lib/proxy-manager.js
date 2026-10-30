@@ -9,7 +9,7 @@ import path from 'node:path';
 import { Transform } from 'node:stream';
 import tls from 'node:tls';
 import httpProxy from 'http-proxy';
-import { isRuleScheduleOpen, listenPortsFor, sourceGroups, targetPortFor, targetPortsFor, targetProtocolFor } from './config-store.js';
+import { isRuleScheduleOpen, listenPortsFor, normalizedListenHost, sourceGroups, targetPortFor, targetPortsFor, targetProtocolFor } from './config-store.js';
 
 const normalizeIp = (value = '') => String(value).replace(/^::ffff:/, '').split('%')[0];
 const urlHost = (host) => net.isIP(String(host).replace(/^\[|\]$/g, '')) === 6 ? `[${String(host).replace(/^\[|\]$/g, '')}]` : host;
@@ -102,7 +102,15 @@ function closeDatagram(socket) {
   });
 }
 
+function ignoreSocketErrors(socket) {
+  if (!socket || typeof socket.on !== 'function' || socket.__proxyErrorGuarded) return socket;
+  socket.__proxyErrorGuarded = true;
+  socket.on('error', () => {});
+  return socket;
+}
+
 function trackStream(runtime, socket) {
+  ignoreSocketErrors(socket);
   runtime.sockets.add(socket);
   socket.once('close', () => runtime.sockets.delete(socket));
   return socket;
@@ -111,6 +119,15 @@ function trackStream(runtime, socket) {
 function trackServer(runtime, server) {
   server.on('connection', (socket) => trackStream(runtime, socket));
   return server;
+}
+
+function guardClientSockets(server) {
+  // TLS resets and aborted handshakes emit on the socket; without a listener Node exits the process.
+  server.on('clientError', (_error, socket) => { ignoreSocketErrors(socket); try { socket.destroy(); } catch {} });
+  server.on('tlsClientError', (_error, socket) => { ignoreSocketErrors(socket); try { socket.destroy(); } catch {} });
+  server.on('connection', ignoreSocketErrors);
+  server.on('secureConnection', ignoreSocketErrors);
+  server.on('error', () => {});
 }
 
 function requestHostname(request) {
@@ -335,6 +352,7 @@ export class ProxyManager {
     this.demoMode = demoMode;
     this.notifier = notifier;
     this.runtimes = new Map();
+    this.webListeners = new Map();
     this.healthTimer = null;
     this.lifecycle = Promise.resolve();
     this.historyFile = store.dataDir && !demoMode ? path.join(store.dataDir, 'runtime-history.json') : null;
@@ -434,7 +452,10 @@ export class ProxyManager {
           results.push({ ruleId: rule.id, rule: rule.name, certificateId: rule.tls.certId, action: 'started' });
           continue;
         }
-        for (const binding of bindings) binding.server.setSecureContext(options);
+        for (const binding of bindings) {
+          if (binding.shared) continue;
+          binding.server.setSecureContext(options);
+        }
         const hadTlsError = Boolean(runtime.tlsError);
         runtime.tlsError = null;
         if (hadTlsError && runtime.state === 'warning') {
@@ -507,6 +528,8 @@ export class ProxyManager {
     clearInterval(this.healthTimer);
     this.healthTimer = null;
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => this.closeRuntime(runtime)));
+    await Promise.allSettled([...this.webListeners.values()].map((bucket) => closeServer(bucket.server)));
+    this.webListeners.clear();
     this.saveHistory();
     this.runtimes.clear();
   }
@@ -556,6 +579,32 @@ export class ProxyManager {
     return runtime;
   }
 
+  webListenKey(rule) {
+    return `${rule.protocol}|${normalizedListenHost(rule.listenHost)}|${rule.listenPort}`;
+  }
+  routeForHost(routes, host) {
+    return routes.find((route) => domainAllowed(route.rule, { headers: { host: host || '' } })) || null;
+  }
+  markSharedWeb(bucket) {
+    const shared = bucket.routes.length > 1;
+    for (const route of bucket.routes) {
+      for (const binding of route.runtime.tlsBindings || []) {
+        if (binding.server === bucket.server) binding.shared = shared;
+      }
+    }
+  }
+  releaseWebRoute(key, route) {
+    try { route.proxy.close(); } catch {}
+    const bucket = this.webListeners.get(key);
+    if (!bucket) return undefined;
+    bucket.routes = bucket.routes.filter((item) => item !== route);
+    if (bucket.routes.length) {
+      this.markSharedWeb(bucket);
+      return undefined;
+    }
+    this.webListeners.delete(key);
+    return closeServer(bucket.server);
+  }
   async startHttp(rule, runtime) {
     const allowed = accessGuard(rule);
     const outboundRequests = new WeakMap();
@@ -604,7 +653,17 @@ export class ProxyManager {
         rejectUpgrade(res, '502 Bad Gateway', '目标服务暂时不可用');
       }
     });
+    const route = { rule, runtime, proxy, allowed, outboundRequests, requestIds, rejectedUploads };
+    const key = this.webListenKey(rule);
+    const bucket = this.webListeners.get(key) || { routes: [], server: null };
+    if (!this.webListeners.has(key)) this.webListeners.set(key, bucket);
+    bucket.routes.push(route);
+    runtime.closers.push(() => this.releaseWebRoute(key, route));
+    const selectRoute = (req) => this.routeForHost(bucket.routes, requestHostname(req));
     const handler = (req, res) => {
+      const matched = selectRoute(req);
+      if (!matched) { handleUnmatchedHttp(this.store, bucket.routes[0]?.proxy, req, res); return; }
+      const { rule, runtime, proxy, allowed, outboundRequests, requestIds, rejectedUploads } = matched;
       const traceId = requestIdFor(req);
       requestIds.set(req, traceId);
       req.headers['x-request-id'] = traceId;
@@ -612,7 +671,6 @@ export class ProxyManager {
       if (!isRuleScheduleOpen(rule)) { res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8', 'Retry-After': '60' }); res.end('代理规则当前处于计划暂停时段'); return; }
       const remote = req.socket.remoteAddress;
       if (!allowed(remote)) { res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('访问被代理规则拒绝'); return; }
-      if (!domainAllowed(rule, req)) { handleUnmatchedHttp(this.store, proxy, req, res); return; }
       const requiredProtocol = rule.protocol === 'https' ? 'https' : 'http';
       if (!rule.protocols.includes(requiredProtocol)) { res.writeHead(426, { 'Content-Type': 'text/plain; charset=utf-8', Upgrade: 'websocket' }); res.end('此入口仅允许 WebSocket 升级'); return; }
       if (rule.forceHttps && rule.protocol === 'http') {
@@ -668,21 +726,39 @@ export class ProxyManager {
         proxy.web(req, res);
       }
     };
+    if (bucket.server) {
+      if (rule.protocol === 'https') runtime.tlsBindings.push({ server: bucket.server, certificateId: rule.tls.certId, listenPort: rule.listenPort, shared: true });
+      this.markSharedWeb(bucket);
+      return;
+    }
     let server;
     if (rule.protocol === 'https') {
       const { options } = certificateOptions(this.store, rule.tls.certId);
-      server = https.createServer(options, handler);
+      server = https.createServer({
+        ...options,
+        SNICallback: (servername, callback) => {
+          try {
+            const chosen = this.routeForHost(bucket.routes, servername) || bucket.routes[0];
+            callback(null, tls.createSecureContext(certificateOptions(this.store, chosen.rule.tls.certId).options));
+          } catch (error) {
+            callback(error);
+          }
+        },
+      }, handler);
     } else {
       server = http.createServer(handler);
     }
-    trackServer(runtime, server);
+    bucket.server = server;
+    guardClientSockets(server);
     server.on('upgrade', (req, socket, head) => {
+      const matched = selectRoute(req);
+      if (!matched) { handleUnmatchedUpgrade(this.store, bucket.routes[0]?.proxy, req, socket, head); return; }
+      const { rule, runtime, proxy, allowed, requestIds } = matched;
       const traceId = requestIdFor(req);
       requestIds.set(req, traceId);
       req.headers['x-request-id'] = traceId;
       if (!isRuleScheduleOpen(rule)) { rejectUpgrade(socket, '503 Service Unavailable', '代理规则当前处于计划暂停时段', { 'Retry-After': '60' }); return; }
       if (!allowed(req.socket.remoteAddress)) { rejectUpgrade(socket, '403 Forbidden', '访问被代理规则拒绝'); return; }
-      if (!domainAllowed(rule, req)) { handleUnmatchedUpgrade(this.store, proxy, req, socket, head); return; }
       const requiredProtocol = rule.protocol === 'https' ? 'wss' : 'ws';
       if (!rule.protocols.includes(requiredProtocol)) { rejectUpgrade(socket, '426 Upgrade Required', '此入口未启用 WebSocket'); return; }
       if (rule.forceHttps && rule.protocol === 'http') {
@@ -698,8 +774,8 @@ export class ProxyManager {
       proxy.ws(req, socket, head);
     });
     await waitForListen(server, rule.listenPort, rule.listenHost);
-    runtime.servers.push(server);
-    if (rule.protocol === 'https') runtime.tlsBindings.push({ server, certificateId: rule.tls.certId, listenPort: rule.listenPort });
+    if (rule.protocol === 'https') runtime.tlsBindings.push({ server, certificateId: rule.tls.certId, listenPort: rule.listenPort, shared: bucket.routes.length > 1 });
+    this.markSharedWeb(bucket);
   }
 
   async startTcp(rule, runtime) {

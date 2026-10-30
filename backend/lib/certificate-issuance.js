@@ -1,17 +1,25 @@
 import { promises as dns } from 'node:dns';
 import acme from 'acme-client';
-import { CloudflareDnsClient } from './cloudflare-dns.js';
+import { createAcmeDnsClient } from './acme-dns.js';
+import { normalizeFreednsUsername } from './freedns-dns.js';
+import { acmeDnsReady } from './automation-config.js';
 import { AliyunClient, automationError } from './aliyun-client.js';
 import { AliyunV2Client, advanceAliyunV2 } from './aliyun-v2.js';
 
 const now = () => new Date().toISOString();
 const DAY = 86400_000;
+const ACME_ISSUE_TIMEOUT_MS = 10 * 60_000;
 const due = (at, interval) => !Number.isFinite(Date.parse(at)) || Date.now() - Date.parse(at) >= interval;
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const withTimeout = (promise, ms, createError) => {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(createError()), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+};
 
 export class CertificateIssuance {
-  constructor({ store, logger, demoMode = false, onCertificate, fetchFn = globalThis.fetch, resolver = dns, acmeLib = acme, aliyunFactory = (config) => config.apiVersion === 'v2' ? new AliyunV2Client(config) : new AliyunClient(config) }) {
-    Object.assign(this, { store, logger, demoMode, onCertificate, fetchFn, resolver, acme: acmeLib, aliyunFactory });
+  constructor({ store, logger, demoMode = false, onCertificate, fetchFn = globalThis.fetch, resolver = dns, acmeLib = acme, acmeIssueTimeoutMs = ACME_ISSUE_TIMEOUT_MS, aliyunFactory = (config) => config.apiVersion === 'v2' ? new AliyunV2Client(config) : new AliyunClient(config) }) {
+    Object.assign(this, { store, logger, demoMode, onCertificate, fetchFn, resolver, acme: acmeLib, acmeIssueTimeoutMs, aliyunFactory });
     this.running = new Map();
     this.events = []; this.eventId = 0; this.activeSteps = new Map();
   }
@@ -50,16 +58,17 @@ export class CertificateIssuance {
   }
   assertConfig(provider) {
     const config = this.store.issuanceConfig();
-    if (provider === 'acme') {
+    if (provider === 'acme' || provider === 'zerossl') {
       const a = config.acme;
-      if (!a.zoneId || !a.apiToken || !a.email || !a.domains.length) throw automationError('请先保存 ACME 的 DNS 凭据、邮箱和域名');
+      if (!acmeDnsReady(a) || !a.email || !a.domains.length) throw automationError('请先保存 ACME 的 DNS 凭据、邮箱和域名');
+      if (provider === 'zerossl' && (!a.eabKid || !a.eabHmacKey)) throw automationError('请先保存 ZeroSSL 的 EAB KID 与 HMAC Key');
     } else {
       const a = config.aliyun;
       if (!a.accessKeyId || !a.accessKeySecret || !a.domain || !a.dnsZone) throw automationError('请先保存阿里云 AccessKey、证书域名和 DNS 主域名');
     }
   }
   issue(provider = this.store.issuanceConfig().provider) {
-    const key = provider === 'acme' ? 'acme' : 'aliyun';
+    const key = provider === 'aliyun-free' ? 'aliyun' : 'acme';
     if (this.running.has(key)) return this.running.get(key);
     this.assertConfig(provider);
     if (this.demoMode) return Promise.resolve({ demoMode: true });
@@ -68,12 +77,14 @@ export class CertificateIssuance {
     const task = Promise.resolve().then(() => key === 'acme' ? this.issueAcme() : this.advanceAliyun()).catch((error) => {
       const config = this.store.issuanceConfig()[key];
       let message = error.message || '证书签发失败';
-      for (const secret of [config.apiToken, config.accessKeySecret, config.accountKeyPem, config.order?.privateKeyPem].filter(Boolean)) message = message.split(secret).join('[已隐藏]');
-      const patch = { lastError: message, lastRunAt: now() };
+      for (const secret of [config.apiToken, config.accessKeySecret, config.accountKeyPem, config.freednsPassword, config.freednsSessionCookie, config.eabHmacKey, config.order?.privateKeyPem].filter(Boolean)) message = message.split(secret).join('[已隐藏]');
+      const patch = { lastError: message, lastRunAt: now(), lastErrorCode: error.code || null, lastErrorDetail: error.detail || null };
       if (key === 'acme' || !config.order) patch.phase = 'error';
       else if (!config.order.id) { patch.phase = 'uncertain'; patch.order = { ...config.order, phase: 'uncertain' }; }
       this.store.patchIssuance(key, patch);
-      if (message !== config.lastError) this.logger?.warn('证书签发暂未完成', { provider: key, error: message });
+      if (message !== config.lastError) {
+        this.logger?.warn('证书签发暂未完成', { provider: key, error: message, code: error.code || null, dnsProvider: key === 'acme' ? config.dnsProvider : undefined });
+      }
       throw automationError(message, error.status || 502);
     }).finally(() => { this.running.delete(key); const state = this.store.issuanceConfig()[key]; this.event(key, state.lastError ? '本轮未完成，请查看错误信息' : state.order ? '本轮检查完成，等待下一次轮询' : state.phase === 'issued' ? '证书已验证并保存到证书库' : '本轮检查结束', state.lastError ? 'error' : 'info'); });
     this.running.set(key, task);
@@ -191,42 +202,145 @@ export class CertificateIssuance {
     this.store.patchIssuance('aliyun', { order, phase: order.phase, lastError: order.phase === 'verify_fail' ? 'CA 审核失败，请检查阿里云订单；修正后可手动重新申请，旧证书不变' : null });
     return { pending: true, phase: order.phase, orderId: order.id };
   }
-  async waitForTxt(name, value) {
-    for (let attempt = 0; attempt < 24; attempt += 1) {
-      try { if ((await this.resolver.resolveTxt(name)).some((parts) => parts.join('') === value)) return; } catch {}
-      await wait(5000);
+  txtAnswerMatches(parts, value) {
+    return parts.join('').replace(/^"|"$/g, '') === value;
+  }
+
+  async waitForChallengeTxt(dnsClient, name, value) {
+    const useApi = typeof dnsClient.hasTxt === 'function';
+    if (useApi) {
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        try { if (await dnsClient.hasTxt(name, value)) break; } catch {}
+        if (attempt === 11) throw automationError('Cloudflare 未确认 TXT 记录已写入，请检查 Zone ID 与 Token 权限', 502);
+        await wait(1000);
+      }
     }
-    throw automationError('DNS 验证记录未在两分钟内生效，请检查 DNS 配置后重试', 504);
+    const attempts = useApi ? 30 : 24;
+    const delayMs = useApi ? 2000 : 5000;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        if ((await this.resolver.resolveTxt(name)).some((parts) => this.txtAnswerMatches(parts, value))) return;
+      } catch {}
+      await wait(delayMs);
+    }
+    throw automationError(useApi
+      ? 'TXT 已在 Cloudflare 生效，但公网 DNS 在约两分钟内仍查不到，请确认域名 NS 指向 Cloudflare 或稍后重试'
+      : 'DNS 验证记录未在两分钟内生效，请检查 DNS 配置后重试', 504);
+  }
+  acmeProgress(step, meta = {}) {
+    this.event('acme', step);
+    this.logger?.info('证书签发进度', { step, ...meta });
+    return step;
+  }
+  async dropAcmeRecords(dnsClient, records, caLabel) {
+    const leftover = [...records.values()];
+    records.clear();
+    await Promise.all(leftover.map(async (entry) => {
+      try {
+        if (typeof dnsClient.deleteTxt === 'function') await dnsClient.deleteTxt(entry.name, entry.value);
+        else await dnsClient.deleteRecord(entry.id ?? entry);
+      } catch { this.logger?.warn(`${caLabel} 验证记录清理失败`, { name: entry.name }); }
+    }));
   }
   async issueAcme() {
-    const config = this.store.issuanceConfig().acme;
-    this.store.patchIssuance('acme', { phase: 'issuing', lastRunAt: now(), lastError: null });
+    const issuance = this.store.issuanceConfig();
+    const config = issuance.acme;
+    const isZeroSsl = issuance.provider === 'zerossl';
+    const caLabel = isZeroSsl ? 'ZeroSSL' : 'ACME';
+    const dnsLabel = config.dnsProvider === 'freedns' ? 'FreeDNS' : 'Cloudflare';
+    let step = this.acmeProgress(`${caLabel} 签发开始`, { dnsProvider: config.dnsProvider, domains: config.domains });
+    this.store.patchIssuance('acme', { phase: 'issuing', lastRunAt: now(), lastError: null, lastErrorCode: null, lastErrorDetail: null });
     let accountKey = config.accountKeyPem;
     if (!accountKey) { accountKey = (await this.acme.crypto.createPrivateEcdsaKey()).toString(); this.store.patchIssuance('acme', { accountKeyPem: accountKey }); }
+    step = this.acmeProgress('账户密钥已就绪');
     const [privateKey, csr] = await this.acme.crypto.createCsr({ altNames: config.domains });
-    const client = new this.acme.Client({ directoryUrl: this.acme.directory.letsencrypt[config.environment], accountKey });
-    const dnsClient = new CloudflareDnsClient({ ...config, fetchFn: this.fetchFn });
+    step = this.acmeProgress('CSR 已生成', { domains: config.domains });
+    const directoryUrl = isZeroSsl ? this.acme.directory.zerossl.production : this.acme.directory.letsencrypt[config.environment];
+    const client = new this.acme.Client({
+      directoryUrl,
+      accountKey,
+      ...(isZeroSsl ? { externalAccountBinding: { kid: config.eabKid, hmacKey: config.eabHmacKey } } : {}),
+    });
+    const dnsClient = createAcmeDnsClient(config, {
+      fetchFn: this.fetchFn,
+      onSession: (cookie) => this.store.patchIssuance('acme', { freednsSessionCookie: cookie || '' }),
+    });
     const records = new Map();
+    let aborted = false;
+    const removeRecord = async (entry, value) => {
+      if (!entry || aborted) return;
+      if (typeof dnsClient.deleteTxt === 'function') await dnsClient.deleteTxt(entry.name, value ?? entry.value);
+      else await dnsClient.deleteRecord(entry.id ?? entry);
+    };
     try {
-      const certificatePem = await client.auto({
+      step = this.acmeProgress(`正在向 ${caLabel} 申请证书`);
+      const certificatePem = await withTimeout(client.auto({
         csr, email: config.email, termsOfServiceAgreed: true, challengePriority: ['dns-01'], skipChallengeVerification: true,
         challengeCreateFn: async (authz, challenge, value) => {
+          if (aborted) throw automationError('证书签发已超时中止', 504);
           const name = `_acme-challenge.${authz.identifier.value.replace(/^\*\./, '')}`;
+          step = this.acmeProgress(`写入 ${dnsLabel} 验证记录 ${name}`, { name });
           const record = await dnsClient.createTxt(name, value);
-          records.set(challenge.url || challenge.token, record.id);
-          await this.waitForTxt(name, value);
+          if (aborted) throw automationError('证书签发已超时中止', 504);
+          records.set(challenge.url || challenge.token, { name, value, id: record.id });
+          step = this.acmeProgress(`等待公网 DNS 生效 ${name}`, { name });
+          await this.waitForChallengeTxt(dnsClient, name, value);
+          if (aborted) throw automationError('证书签发已超时中止', 504);
+          step = this.acmeProgress(`公网 DNS 已可见 ${name}`, { name });
         },
-        challengeRemoveFn: async (authz, challenge) => {
+        challengeRemoveFn: async (authz, challenge, value) => {
           const key = challenge.url || challenge.token;
-          await dnsClient.deleteRecord(records.get(key)); records.delete(key);
+          const entry = records.get(key);
+          if (entry) step = this.acmeProgress(`清理 ${dnsLabel} 验证记录 ${entry.name}`, { name: entry.name });
+          await removeRecord(entry, value);
+          records.delete(key);
         },
+      }), this.acmeIssueTimeoutMs, () => {
+        aborted = true;
+        void this.dropAcmeRecords(dnsClient, records, caLabel);
+        const limitText = this.acmeIssueTimeoutMs >= 60_000
+          ? `${Math.round(this.acmeIssueTimeoutMs / 60_000)} 分钟`
+          : `${this.acmeIssueTimeoutMs} 毫秒`;
+        return Object.assign(automationError(`证书签发超过 ${limitText}未完成（最后步骤：${step}），请稍后重试`, 504), { code: 'ACME_ISSUE_TIMEOUT' });
       });
-      const saved = await this.onCertificate({ name: `ACME · ${config.domains[0]}`, provider: 'acme', environment: config.environment, domains: config.domains, targetCertificateId: config.certificateId, certificatePem: String(certificatePem), privateKeyPem: privateKey.toString() });
-      this.store.patchIssuance('acme', { phase: 'issued', certificateId: saved.certificate.id, lastSuccessAt: now(), lastError: null });
-      this.logger?.info('ACME 证书已签发', { certificateId: saved.certificate.id, environment: config.environment });
+      if (aborted) throw automationError('证书签发已超时中止', 504);
+      step = this.acmeProgress('证书已下载，正在保存');
+      const environment = isZeroSsl ? 'production' : config.environment;
+      const saved = await this.onCertificate({
+        name: `${caLabel} · ${config.domains[0]}`,
+        provider: issuance.provider,
+        environment,
+        domains: config.domains,
+        targetCertificateId: config.certificateId,
+        certificatePem: String(certificatePem),
+        privateKeyPem: privateKey.toString(),
+      });
+      this.store.patchIssuance('acme', { phase: 'issued', certificateId: saved.certificate.id, lastSuccessAt: now(), lastError: null, lastErrorCode: null, lastErrorDetail: null });
+      this.acmeProgress(`${caLabel} 证书已签发`, { certificateId: saved.certificate.id, environment });
+      this.logger?.info(`${caLabel} 证书已签发`, { certificateId: saved.certificate.id, environment });
       return saved;
     } finally {
-      for (const id of records.values()) { try { await dnsClient.deleteRecord(id); } catch { this.logger?.warn('ACME 验证记录清理失败，请检查 Cloudflare DNS'); } }
+      if (!aborted) await this.dropAcmeRecords(dnsClient, records, caLabel);
+    }
+  }
+  async verifyFreedns(input = {}) {
+    const config = this.store.issuanceConfig().acme;
+    const username = normalizeFreednsUsername(input.freednsUsername ?? config.freednsUsername);
+    const password = String(input.freednsPassword ?? '').trim() || config.freednsPassword;
+    if (!username || !password) throw automationError('请填写 FreeDNS UserID 和密码后再测试（仅保存会话、未保存密码时无法验证）', 400);
+    const useStored = !String(input.freednsPassword ?? '').trim() && !input.freednsUsername;
+    const client = createAcmeDnsClient(
+      { ...config, freednsUsername: username, freednsPassword: password, freednsSessionCookie: '' },
+      {
+        fetchFn: this.fetchFn,
+        onSession: (cookie) => { if (useStored) this.store.patchIssuance('acme', { freednsSessionCookie: cookie || '' }); },
+      },
+    );
+    try {
+      await client.login();
+      return { ok: true, message: 'FreeDNS 登录成功' };
+    } catch (error) {
+      return { ok: false, code: error.code || null, message: error.message, detail: error.detail || null };
     }
   }
   needsRenewal(config) {
@@ -241,7 +355,7 @@ export class CertificateIssuance {
     if (pending && !['verify_fail', 'uncertain', 'creating'].includes(pending.phase) && due(config.aliyun.lastRunAt, config.aliyun.lastError ? 15 * 60_000 : 60_000)) {
       try { await this.issue('aliyun-free'); } catch {}
     }
-    const key = config.provider === 'acme' ? 'acme' : 'aliyun';
+    const key = config.provider === 'aliyun-free' ? 'aliyun' : 'acme';
     const current = this.store.issuanceConfig()[key];
     if (current.autoRenew && !current.order && this.needsRenewal(current) && due(current.lastRunAt, 6 * 3600_000)) { try { await this.issue(config.provider); } catch {} }
   }

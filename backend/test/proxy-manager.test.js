@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import test from 'node:test';
+import forge from 'node-forge';
 import { ConfigStore } from '../lib/config-store.js';
 import { ProxyManager } from '../lib/proxy-manager.js';
 
@@ -330,6 +333,98 @@ test('closes active UDP sessions when the proxy manager stops', async () => {
   }
 });
 
+test('keeps serving HTTPS after a client aborts the TLS connection', async () => {
+  const keys = forge.pki.rsa.generateKeyPair(2048);
+  const cert = forge.pki.createCertificate();
+  cert.publicKey = keys.publicKey;
+  cert.serialNumber = '02';
+  cert.validity.notBefore = new Date(Date.now() - 60_000);
+  cert.validity.notAfter = new Date(Date.now() + 86400_000);
+  const attrs = [{ name: 'commonName', value: 'reset.example.test' }];
+  cert.setSubject(attrs);
+  cert.setIssuer(attrs);
+  cert.setExtensions([{ name: 'subjectAltName', altNames: [{ type: 2, value: 'reset.example.test' }] }]);
+  cert.sign(keys.privateKey, forge.md.sha256.create());
+  const target = http.createServer((req, res) => res.end('alive'));
+  const targetPort = await listen(target);
+  const proxyPort = await freePort();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-tls-reset-'));
+  const store = new ConfigStore(directory); store.load();
+  const certPath = path.join(directory, 'reset.crt');
+  const keyPath = path.join(directory, 'reset.key');
+  fs.writeFileSync(certPath, forge.pki.certificateToPem(cert));
+  fs.writeFileSync(keyPath, forge.pki.privateKeyToPem(keys.privateKey));
+  store.addCertificate({ id: 'reset-cert', name: 'Reset', certPath, keyPath });
+  store.createRule({ name: 'Reset', protocols: ['https'], listenHost: '127.0.0.1', listenPort: proxyPort, domains: ['reset.example.test'], targetProtocols: ['http'], targetHost: '127.0.0.1', targetPort, tls: { certId: 'reset-cert' } });
+  const manager = new ProxyManager({ store, logger });
+  try {
+    await manager.startAll();
+    await Promise.all(Array.from({ length: 8 }, () => new Promise((resolve) => {
+      const socket = tls.connect({ host: '127.0.0.1', port: proxyPort, servername: 'reset.example.test', rejectUnauthorized: false });
+      socket.once('secureConnect', () => { socket.destroy(); resolve(); });
+      socket.once('error', () => resolve());
+      setTimeout(resolve, 200);
+    })));
+    const body = await new Promise((resolve, reject) => {
+      const req = https.request({ host: '127.0.0.1', port: proxyPort, servername: 'reset.example.test', headers: { host: 'reset.example.test' }, rejectUnauthorized: false, path: '/' }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => { data += chunk; });
+        res.on('end', () => resolve(data));
+      });
+      req.once('error', reject);
+      req.end();
+    });
+    assert.equal(body, 'alive');
+  } finally {
+    await manager.stopAll(); await close(target); fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('routes two HTTPS hostnames on one port to different backends', async () => {
+  const keys = forge.pki.rsa.generateKeyPair(2048);
+  const cert = forge.pki.createCertificate();
+  cert.publicKey = keys.publicKey;
+  cert.serialNumber = '01';
+  cert.validity.notBefore = new Date(Date.now() - 60_000);
+  cert.validity.notAfter = new Date(Date.now() + 86400_000);
+  const attrs = [{ name: 'commonName', value: 'a.example.test' }];
+  cert.setSubject(attrs);
+  cert.setIssuer(attrs);
+  cert.setExtensions([{ name: 'subjectAltName', altNames: [{ type: 2, value: 'a.example.test' }, { type: 2, value: 'b.example.test' }] }]);
+  cert.sign(keys.privateKey, forge.md.sha256.create());
+  const alpha = http.createServer((req, res) => res.end('alpha'));
+  const beta = http.createServer((req, res) => res.end('beta'));
+  const alphaPort = await listen(alpha);
+  const betaPort = await listen(beta);
+  const proxyPort = await freePort();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-proxy-vhost-'));
+  const store = new ConfigStore(directory); store.load();
+  const certPath = path.join(directory, 'shared.crt');
+  const keyPath = path.join(directory, 'shared.key');
+  fs.writeFileSync(certPath, forge.pki.certificateToPem(cert));
+  fs.writeFileSync(keyPath, forge.pki.privateKeyToPem(keys.privateKey));
+  store.addCertificate({ id: 'shared-cert', name: 'Shared', certPath, keyPath });
+  store.createRule({ name: 'Alpha', protocols: ['https'], listenHost: '127.0.0.1', listenPort: proxyPort, domains: ['a.example.test'], targetProtocols: ['http'], targetHost: '127.0.0.1', targetPort: alphaPort, tls: { certId: 'shared-cert' } });
+  store.createRule({ name: 'Beta', protocols: ['https'], listenHost: '127.0.0.1', listenPort: proxyPort, domains: ['b.example.test'], targetProtocols: ['http'], targetHost: '127.0.0.1', targetPort: betaPort, tls: { certId: 'shared-cert' } });
+  const manager = new ProxyManager({ store, logger });
+  const bodyOf = (host) => new Promise((resolve, reject) => {
+    const req = https.request({ host: '127.0.0.1', port: proxyPort, servername: host, headers: { host }, rejectUnauthorized: false, path: '/' }, (res) => {
+      let body = '';
+      res.on('data', (chunk) => { body += chunk; });
+      res.on('end', () => resolve(body));
+    });
+    req.once('error', reject);
+    req.end();
+  });
+  try {
+    await manager.startAll();
+    assert.equal(await bodyOf('a.example.test'), 'alpha');
+    assert.equal(await bodyOf('b.example.test'), 'beta');
+  } finally {
+    await manager.stopAll(); await close(alpha); await close(beta); fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('applies domain policy to WebSocket upgrades', async () => {
   const target = http.createServer();
   target.on('upgrade', (req, socket) => socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'));
@@ -379,6 +474,15 @@ test('reload closes active TCP streams instead of hanging', async () => {
   try {
     await manager.startAll();
     await new Promise((resolve, reject) => { client.once('error', reject); client.connect(proxyPort, '127.0.0.1', resolve); });
+    await new Promise((resolve, reject) => {
+      const deadline = Date.now() + 2000;
+      const wait = () => {
+        if (manager.snapshot().rules[rule.id].connections >= 1) return resolve();
+        if (Date.now() > deadline) return reject(new Error('TCP 连接计数未就绪'));
+        setImmediate(wait);
+      };
+      wait();
+    });
     const result = await Promise.race([manager.reload().then(() => 'reloaded'), new Promise((resolve) => setTimeout(() => resolve('timeout'), 1000))]);
     assert.equal(result, 'reloaded');
     assert.equal(manager.snapshot().rules[rule.id].connections, 1);

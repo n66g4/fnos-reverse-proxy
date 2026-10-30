@@ -194,6 +194,23 @@ test('the factory constructs official cloud DNS SDKs with fixed HTTPS endpoints'
   assert.ok(createDdnsClient(store.ddnsConfig()) instanceof CloudflareDnsClient);
 });
 
+test('Cloudflare hasTxt matches TXT record content for ACME polling', async () => {
+  const client = new CloudflareDnsClient({
+    zoneId,
+    apiToken: 'test-only',
+    fetchFn: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        success: true,
+        result: [{ id: 'txt-1', name: '_acme-challenge.example.com', type: 'TXT', content: 'dns-proof' }],
+      }),
+    }),
+  });
+  assert.equal(await client.hasTxt('_acme-challenge.example.com', 'dns-proof'), true);
+  assert.equal(await client.hasTxt('_acme-challenge.example.com', 'other'), false);
+});
+
 test('Cloudflare refuses ambiguous same-type records and CNAME conflicts before writing', async () => {
   for (const types of [['A', 'A'], ['CNAME']]) {
     const methods = [];

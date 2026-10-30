@@ -250,6 +250,7 @@ router.post('/integrations/webhook/test', asyncRoute(async (req, res) => {
   res.json({ ok: true, status: result.status });
 }));
 router.get('/integrations/ddns', (req, res) => res.json({ integration: { ...store.ddnsStatus(), detection: ddnsService.detectionStatus(), running: Boolean(ddnsService.running), demoMode: DEMO_MODE } }));
+router.get('/integrations/ddns/interfaces', (req, res) => res.json({ interfaces: ddnsService.interfaces() }));
 for (const scope of ['ddns', 'certificate-issuance']) {
   // Read-only draft lookup: never save credentials, consume quota, or change DNS.
   router.post(`/integrations/${scope}/aliyun/resolve-zone`, asyncRoute(async (req, res) => {
@@ -257,7 +258,7 @@ for (const scope of ['ddns', 'certificate-issuance']) {
   }));
 }
 router.post('/integrations/ddns/detect', asyncRoute(async (req, res) => {
-  const result = await ddnsService.detect(req.body?.recordType);
+  const result = await ddnsService.detect(req.body?.recordType, req.body?.stack);
   res.json({ result, detection: ddnsService.detectionStatus() });
 }));
 router.put('/integrations/ddns', (req, res) => {
@@ -266,12 +267,12 @@ router.put('/integrations/ddns', (req, res) => {
 });
 router.post('/integrations/ddns/sync', asyncRoute(async (req, res) => {
   if (ddnsService.running) return res.status(409).json({ error: 'DDNS 正在处理，请稍后重试' });
-  const result = await ddnsService.sync();
+  const result = await ddnsService.sync({ taskId: req.body?.taskId });
   res.json({ result, integration: store.ddnsStatus() });
 }));
 router.post('/integrations/ddns/test', asyncRoute(async (req, res) => {
   if (ddnsService.running) return res.status(409).json({ error: 'DDNS 正在处理，请稍后重试' });
-  const result = await ddnsService.test();
+  const result = await ddnsService.test({ taskId: req.body?.taskId });
   res.json({ result, integration: store.ddnsStatus() });
 }));
 router.get('/integrations/certificate-issuance', (req, res) => res.json({ integration: certificateIssuance.status() }));
@@ -289,6 +290,10 @@ router.post('/integrations/certificate-issuance/issue', (req, res) => {
   const result = certificateIssuance.kick();
   res.status(202).json({ result, integration: certificateIssuance.status() });
 });
+router.post('/integrations/certificate-issuance/freedns/verify', asyncRoute(async (req, res) => {
+  const result = await certificateIssuance.verifyFreedns(req.body);
+  res.json({ result, integration: certificateIssuance.status() });
+}));
 router.post('/integrations/certificate-issuance/aliyun/quota', asyncRoute(async (req, res) => {
   const result = await certificateIssuance.refreshQuota();
   res.json({ result, integration: certificateIssuance.status() });
