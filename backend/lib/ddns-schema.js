@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import net from 'node:net';
+import { DEFAULT_IPV4_URLS, DEFAULT_IPV6_URLS } from './ddns-ip.js';
 
 const text = (value) => String(value ?? '').trim();
 const flag = (value) => value === true || value === 'true' || value === 1;
@@ -52,7 +53,7 @@ function defaultStack(type = 'A') {
   return {
     enabled: type === 'A',
     getType: 'url',
-    urls: type === 'AAAA' ? ['https://api6.ipify.org'] : ['https://api.ipify.org'],
+    urls: type === 'AAAA' ? [...DEFAULT_IPV6_URLS] : [...DEFAULT_IPV4_URLS],
     netInterface: '',
     command: '',
     domains: [],

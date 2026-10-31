@@ -1,10 +1,32 @@
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import os from 'node:os';
-import { publicIpEndpoint } from './cloudflare-dns.js';
 import { automationError } from './aliyun-client.js';
 
 const familyOf = (recordType) => (recordType === 'AAAA' ? 6 : 4);
+
+/** Domestic-first fallbacks: many fnOS NASes cannot reach api.ipify.org. */
+export const DEFAULT_IPV4_URLS = [
+  'https://ddns.oray.com/checkip',
+  'https://ip.3322.net',
+  'https://myip.ipip.net',
+  'https://api.ipify.org?format=json',
+  'https://ipv4.icanhazip.com',
+];
+
+export const DEFAULT_IPV6_URLS = [
+  'https://api6.ipify.org?format=json',
+  'https://ipv6.icanhazip.com',
+  'https://v6.ident.me',
+];
+
+export function publicIpEndpoints(recordType) {
+  return recordType === 'AAAA' ? [...DEFAULT_IPV6_URLS] : [...DEFAULT_IPV4_URLS];
+}
+
+export function publicIpEndpoint(recordType) {
+  return publicIpEndpoints(recordType)[0];
+}
 
 export function isPublicAddress(ip, recordType) {
   if (net.isIP(ip) !== familyOf(recordType)) return false;
@@ -103,7 +125,14 @@ async function readResponseBody(response) {
 }
 
 async function fetchIpFromUrl(url, recordType, fetchFn) {
-  const response = await fetchFn(url, { headers: { Accept: 'application/json,text/plain,*/*' }, redirect: 'error', signal: AbortSignal.timeout(10_000) });
+  const response = await fetchFn(url, {
+    headers: {
+      Accept: 'application/json,text/plain,*/*',
+      'User-Agent': 'fnos-reverse-proxy-ddns/1.0',
+    },
+    redirect: 'error',
+    signal: AbortSignal.timeout(10_000),
+  });
   if (!response.ok) throw new Error('response');
   const contentType = String(response.headers?.get?.('content-type') || '');
   const body = await readResponseBody(response);
@@ -120,22 +149,19 @@ async function fetchIpFromUrl(url, recordType, fetchFn) {
 }
 
 export async function resolveFromUrls(recordType, urls = [], { fetchFn = globalThis.fetch } = {}) {
-  const list = (Array.isArray(urls) && urls.length ? urls : [publicIpEndpoint(recordType)]).map((item) => {
-    const value = String(item || '').trim();
-    if (!value) return '';
-    if (value.includes('://')) return value;
-    return value;
-  }).filter(Boolean);
-  let lastError = null;
+  const raw = Array.isArray(urls) && urls.length ? urls : publicIpEndpoints(recordType);
+  const list = raw.map((item) => String(item || '').trim()).filter(Boolean);
   for (const url of list) {
     try {
       return await fetchIpFromUrl(url.includes('://') ? url : `https://${url}`, recordType, fetchFn);
-    } catch (error) {
-      lastError = error;
+    } catch {
+      /* try next */
     }
   }
-  const source = list[0] ? (() => { try { return new URL(list[0].includes('://') ? list[0] : `https://${list[0]}`).hostname; } catch { return list[0]; } })() : 'ipify';
-  throw automationError(`公网 IPv${recordType === 'AAAA' ? '6' : '4'} 检测失败，请检查 NAS 网络及 ${source} 可达性${recordType === 'AAAA' ? '，并确认网络支持 IPv6' : ''}${lastError ? '' : ''}`, 502);
+  throw automationError(
+    `公网 IPv${recordType === 'AAAA' ? '6' : '4'} 检测失败，请检查 NAS 出网或更换 IP 接口（默认会依次尝试多个公共服务）${recordType === 'AAAA' ? '，并确认网络支持 IPv6' : ''}`,
+    502,
+  );
 }
 
 export async function resolveIp(stack, recordType, options = {}) {

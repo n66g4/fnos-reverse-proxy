@@ -20,7 +20,9 @@ const ddnsProviders = {
 };
 const emptyStack = (type = 'A') => ({
   enabled: type === 'A', getType: 'url',
-  urls: type === 'AAAA' ? ['https://api6.ipify.org'] : ['https://api.ipify.org'],
+  urls: type === 'AAAA'
+    ? ['https://api6.ipify.org?format=json', 'https://ipv6.icanhazip.com', 'https://v6.ident.me']
+    : ['https://ddns.oray.com/checkip', 'https://ip.3322.net', 'https://myip.ipip.net', 'https://api.ipify.org?format=json'],
   netInterface: '', command: '', domains: [],
 });
 const emptyTask = () => ({
@@ -104,7 +106,7 @@ function StackFields({ label, stack, onChange }) {
     <Check checked={stack.enabled} onChange={(value) => set('enabled', value)} title={`启用 ${label}`} description={`同步时更新 ${label} 域名列表。`} />
     {stack.enabled ? <>
       <Field label="取 IP 方式"><UISelect value={stack.getType} onChange={(event) => set('getType', event.target.value)}><option value="url">接口</option><option value="netInterface">网卡</option><option value="command">命令</option></UISelect></Field>
-      {stack.getType === 'url' ? <Field label="IP 接口（每行一个）" hint="默认 ipify；可填写多个，失败时依次尝试"><textarea rows="2" value={(stack.urls || []).join('\n')} onChange={(event) => set('urls', event.target.value.split(/\n+/))} /></Field> : null}
+      {stack.getType === 'url' ? <Field label="IP 接口（每行一个）" hint="默认含花生壳/3322/ipip/ipify 等，失败时依次尝试"><textarea rows="3" value={(stack.urls || []).join('\n')} onChange={(event) => set('urls', event.target.value.split(/\n+/))} /></Field> : null}
       {stack.getType === 'netInterface' ? <Field label="网卡名或 /正则/" hint="例如 eth0 或 /en.*/"><input value={stack.netInterface} onChange={(event) => set('netInterface', event.target.value)} /></Field> : null}
       {stack.getType === 'command' ? <Field label="取 IP 命令" hint="在 NAS 上执行，解析 stdout 中的首个公网地址；请谨慎使用"><input value={stack.command} onChange={(event) => set('command', event.target.value)} placeholder="curl -4 -s ifconfig.me" /></Field> : null}
       <Field label="域名列表（每行一个）"><textarea rows="3" value={(stack.domains || []).join('\n')} onChange={(event) => set('domains', event.target.value.split(/[\n,，;；]+/).map((item) => item.trim()).filter(Boolean))} placeholder={'home.example.com\nvpn.example.com'} /></Field>

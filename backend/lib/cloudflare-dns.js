@@ -3,9 +3,7 @@ const clean = (value) => String(value ?? '').trim();
 const integrationError = (message, status = 502) => Object.assign(new Error(message), { status });
 const errorMessage = (error) => clean(error?.message) || '未知错误';
 
-export function publicIpEndpoint(recordType) {
-  return recordType === 'AAAA' ? 'https://api6.ipify.org?format=json' : 'https://api.ipify.org?format=json';
-}
+export { publicIpEndpoint, publicIpEndpoints } from './ddns-ip.js';
 
 export class CloudflareDnsClient {
   constructor({ zoneId, apiToken, fetchFn = globalThis.fetch }) {
